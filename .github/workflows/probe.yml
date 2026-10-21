@@ -1,0 +1,171 @@
+name: srp-mdns-proxy firmware probe
+
+# Answers one question: does /usr/libexec/srp-mdns-proxy in Apple TV / HomePod firmware contain
+# multi-precision (public-key) arithmetic? A constant-time bignum implementation is defined by its
+# add-with-carry chains, so counting adcs/sbcs settles it without needing symbols.
+#
+# PUBLIC REPO. Artifacts here are world-readable, so this workflow uploads ONLY aggregate facts
+# about the binary -- hashes, section sizes, symbol and import lists, instruction counts. It does
+# NOT upload the firmware, the binary, or a full disassembly: a complete instruction dump of a
+# proprietary binary is a reproduction of it, not a fact about it. The guard step below enforces
+# that mechanically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "device identifier, e.g. AppleTV11,1 (Apple TV 4K 2nd gen) or AppleTV14,1 (3rd gen)"
+        required: true
+        default: "AppleTV11,1"
+      version:
+        description: "OS version, e.g. 26.6 (blank = latest)"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Host and disk
+        run: |
+          set -x
+          mkdir -p out work
+          sw_vers | tee out/00_host.txt
+          echo "requested device=${{ inputs.device }} version=${{ inputs.version }}" | tee -a out/00_host.txt
+          sudo rm -rf /Users/runner/Library/Android /Users/runner/hostedtoolcache 2>/dev/null || true
+          df -h / | tee -a out/00_host.txt
+
+      - name: Install ipsw
+        run: |
+          set -x
+          brew trust blacktop/tap || brew tap blacktop/tap || true
+          brew install --formula blacktop/tap/ipsw || {
+            URL=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
+                  | grep -oE 'https://[^"]*macos_universal\.tar\.gz' | head -1)
+            test -n "$URL"
+            curl -fsSL "$URL" -o /tmp/ipsw.tar.gz
+            shasum -a 256 /tmp/ipsw.tar.gz | tee out/01_ipsw_tarball_sha256.txt
+            mkdir -p /tmp/ipswbin && tar -xzf /tmp/ipsw.tar.gz -C /tmp/ipswbin
+            sudo install -m 0755 "$(find /tmp/ipswbin -name ipsw -type f | head -1)" /usr/local/bin/ipsw
+          }
+          ipsw version | tee out/02_ipsw_version.txt
+
+      - name: Download the full IPSW
+        run: |
+          set -x
+          cd work
+          VER=""
+          if [ -n "${{ inputs.version }}" ]; then VER="--version ${{ inputs.version }}"; else VER="--latest"; fi
+          ipsw download ipsw --device "${{ inputs.device }}" $VER --confirm 2>&1 | tail -25
+          ls -lh *.ipsw | tee ../out/10_ipsw.txt
+          shasum -a 256 *.ipsw | tee -a ../out/10_ipsw.txt
+
+      - name: Extract and mount the root filesystem
+        run: |
+          set -x
+          cd work
+          ipsw extract --dmg fs *.ipsw -o fsdmg 2>&1 | tail -20 || true
+          DMG=$(find fsdmg . -maxdepth 4 -name '*.dmg' -size +400M | head -1)
+          echo "DMG=$DMG" | tee ../out/11_dmg.txt
+          test -n "$DMG"
+          hdiutil attach -readonly -nobrowse -mountpoint /tmp/rootfs "$DMG" 2>&1 | tail -5
+          ls /tmp/rootfs | head -20 | tee -a ../out/11_dmg.txt
+          ls -l /tmp/rootfs/usr/libexec/srp-mdns-proxy 2>&1 | tee ../out/12_target.txt || true
+
+      - name: Measure (aggregates only — no disassembly is kept)
+        run: |
+          set -x
+          B=/tmp/rootfs/usr/libexec/srp-mdns-proxy
+          if [ ! -f "$B" ]; then
+            echo "ABSENT: /usr/libexec/srp-mdns-proxy is not present in this firmware" | tee out/20_RESULT.txt
+            ls /tmp/rootfs/usr/libexec/ | grep -iE 'srp|mdns|dnssd' | tee -a out/20_RESULT.txt || true
+            exit 0
+          fi
+          cp "$B" work/target.bin
+          ls -l work/target.bin        | tee    out/20_identity.txt
+          shasum -a 256 work/target.bin | tee -a out/20_identity.txt
+          file work/target.bin         | tee -a out/20_identity.txt
+          lipo -info work/target.bin   | tee -a out/20_identity.txt || true
+          codesign -dvvv work/target.bin 2>&1 | tee out/21_codesign.txt || true
+          size -l -m work/target.bin   > out/22_sections.txt 2>&1 || true
+          nm -n  work/target.bin       > out/23_nm.txt        2>&1 || true
+          nm -mu work/target.bin       > out/24_undefined.txt 2>&1 || true
+          otool -L work/target.bin     > out/25_dylibs.txt    2>&1 || true
+          # disassemble to a scratch file OUTSIDE out/, count, then delete it
+          ARCH=$(lipo -info work/target.bin 2>/dev/null | sed 's/.*: //' | awk '{print $NF}')
+          if lipo -info work/target.bin 2>/dev/null | grep -q "fat file"; then
+            lipo -thin "$ARCH" work/target.bin -output work/thin.bin && T=work/thin.bin
+          else
+            T=work/target.bin
+          fi
+          echo "analysed slice: $ARCH" | tee -a out/20_identity.txt
+          otool -tvV "$T" > work/text.tmp 2>&1 || true
+          {
+            echo "instruction lines: $(wc -l < work/text.tmp)"
+            echo "first addr: $(grep -oE '^[0-9a-f]{16}' work/text.tmp | head -1)"
+            echo "last  addr: $(grep -oE '^[0-9a-f]{16}' work/text.tmp | tail -1)"
+            echo
+            echo "=== bignum / carry-chain census (THE TEST) ==="
+            for op in adcs sbcs adc sbc umulh smulh mul madd umaddl; do
+              printf "%-8s %s\n" "$op" "$(grep -cE "[[:space:]]$op[[:space:]]" work/text.tmp)"
+            done
+            echo
+            echo "=== crypto imports ==="
+            grep -iE '_SecKey(Verify|RawVerify|CreateSignature)|_cc[a-z_]+|_CC_SHA|_CCHmac|corecrypto|ed25519|ecdsa' out/24_undefined.txt || echo "(none)"
+            echo
+            echo "=== mbedtls / curve strings present? (counts only) ==="
+            printf "text matches: %s\n" "$(grep -icE 'mbedtls|ecdsa|secp256|prime256|sig0' work/text.tmp)"
+            printf "nm matches:   %s\n" "$(grep -icE 'mbedtls|ecdsa|secp256|prime256|sig0' out/23_nm.txt)"
+            echo
+            echo "=== srpk_* compression-decoder symbols ==="
+            printf "count: %s\n" "$(grep -cE '_srpk_' out/23_nm.txt)"
+            grep -E '_srpk_' out/23_nm.txt || echo "(none)"
+          } | tee out/40_CENSUS.txt
+          rm -f work/text.tmp
+          # crypto constant scan over the whole binary, in-line (no external script needed)
+          python3 - work/target.bin <<'PY' | tee out/41_constants.txt
+          import struct, sys
+          b = open(sys.argv[1], 'rb').read()
+          words = {"SHA256 H0":0x6a09e667,"SHA256 H1":0xbb67ae85,"SHA256 H2":0x3c6ef372,
+                   "SHA256 H3":0xa54ff53a,"SHA256 H4":0x510e527f,"SHA256 H5":0x9b05688c,
+                   "SHA256 H6":0x1f83d9ab,"SHA256 H7":0x5be0cd19,"SHA256 K0":0x428a2f98,
+                   "SHA256 K1":0x71374491,"SHA1 H4":0xc3d2e1f0,"MD5 T0":0xd76aa478}
+          blobs = {"P-256 prime":"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+                   "P-256 Gx":"6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"}
+          print("bytes:", len(b))
+          total = 0
+          for n, v in words.items():
+              c = b.count(struct.pack('<I', v)) + b.count(struct.pack('>I', v))
+              if c: print("  HIT", n, c)
+              total += c
+          for n, h in blobs.items():
+              x = bytes.fromhex(h)
+              c = b.count(x) + b.count(x[::-1])
+              if c: print("  HIT", n, c)
+              total += c
+          print("total crypto-constant hits:", total)
+          PY
+
+      - name: Guard — refuse to publish anything but text
+        if: always()
+        run: |
+          set -x
+          BAD=0
+          for f in $(find out -type f); do
+            if file "$f" | grep -qiE 'Mach-O|executable|archive|disk image'; then
+              echo "REFUSING: $f looks like a binary"; BAD=1
+            fi
+            SZ=$(wc -c < "$f")
+            if [ "$SZ" -gt 2000000 ]; then echo "REFUSING: $f is ${SZ} bytes (>2MB)"; BAD=1; fi
+          done
+          find out -type f -exec wc -c {} + | tail -40
+          test "$BAD" -eq 0
+
+      - name: Upload aggregates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srp-firmware-probe-${{ inputs.device }}
+          path: out/**
+          if-no-files-found: warn

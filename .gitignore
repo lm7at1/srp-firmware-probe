@@ -1,0 +1,6 @@
+work/
+out/
+*.ipsw
+*.dmg
+*.aea
+*.bin
