@@ -169,3 +169,5 @@ jobs:
           name: srp-firmware-probe-${{ inputs.device }}
           path: out/**
           if-no-files-found: warn
+
+# Re-pushed to trigger workflow indexing on the default branch.
