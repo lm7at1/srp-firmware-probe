@@ -169,6 +169,23 @@ jobs:
                  print $1"  "$NF"  <- "sym }' work/text.tmp > out/42_verify_callsites.txt || true
           wc -l out/42_verify_callsites.txt | tee -a out/42_verify_callsites.txt
           cat out/42_verify_callsites.txt
+          # Is _srpk_label_from_wire_ the unchecked (macOS 26.6.2) or bounded (27.0.1) form?
+          # 27.0.1 added an offset-vs-extent test: ldr lim / ldr msg / sub / cmp / b.hi.
+          # Emit the function's size and the block around the "underline-char-ptr" handling only.
+          awk '/^_srpk_label_from_wire_:$/{f=1} f{print} f&&/^_[A-Za-z_0-9.]+:$/&&!/_srpk_label_from_wire_:/{exit}' \
+              work/text.tmp > work/lfw.txt || true
+          {
+            echo "_srpk_label_from_wire_ instructions: $(grep -cE '^[0-9a-f]{16}' work/lfw.txt)"
+            echo
+            echo "=== bound-check shape: sub/cmp/b.hi triples in this function ==="
+            grep -nE '[[:space:]](sub|cmp|b\.hi|b\.hs)[[:space:]]' work/lfw.txt | head -40
+            echo
+            echo "=== context around the integer reader call (the vulnerable site) ==="
+            grep -nE 'srpk_integer_from_wire_max_' work/lfw.txt | head -5
+            N=$(grep -nE 'srpk_integer_from_wire_max_' work/lfw.txt | sed -n '2p' | cut -d: -f1)
+            if [ -n "$N" ]; then sed -n "$((N)),$((N+22))p" work/lfw.txt; fi
+          } | tee out/43_label_from_wire_bound.txt
+          rm -f work/lfw.txt
           rm -f work/text.tmp
           python3 - work/target.bin <<'PY' | tee out/41_constants.txt
           import struct, sys
