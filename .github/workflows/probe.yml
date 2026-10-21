@@ -192,6 +192,12 @@ jobs:
           # Same CFG + dominator method as 01_PRODUCTION_CALL_PATH.md section 1.4.
           python3 cfg_order.py work/text.tmp _srpk_label_from_wire_ _srp_sig0_verify \
             > out/44_decoder_vs_verify_order.txt 2>&1 || true
+          # Verification may sit behind a call to another function (on HomePod, _srp_evaluate is
+          # what calls _srp_sig0_verify). Re-run the dominator test with that call as the gate, so
+          # the claim rests on a blocking test and not only on an exhibited witness path.
+          python3 cfg_order.py work/text.tmp _srpk_label_from_wire_ _srp_evaluate \
+            > out/46_decoder_vs_srp_evaluate.txt 2>&1 || true
+          sed -n '/FUNCTION _srp_dns_evaluate/,$p' out/46_decoder_vs_srp_evaluate.txt | head -30
           # and the other direction: who calls the verifier, and who calls the evaluator
           {
             echo "=== callers of _srp_sig0_verify ==="
