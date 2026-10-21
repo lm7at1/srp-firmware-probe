@@ -94,8 +94,17 @@ jobs:
           cd work
           IPSW=$(ls *.ipsw | head -1)
           ipsw extract --dmg fs "$IPSW" -o fsdmg 2>&1 | tail -20 || true
-          find fsdmg . -maxdepth 4 -name '*.dmg' -size +200M -exec ls -lh {} + | tee ../out/11_dmg.txt || true
-          DMG=$(find fsdmg . -maxdepth 4 -name '*.dmg' -size +200M | head -1)
+          find fsdmg -type f \( -name '*.dmg' -o -name '*.aea' \) -exec ls -lh {} + | tee ../out/11_dmg.txt || true
+          # Recent firmware ships the filesystem as an Apple Encrypted Archive (.dmg.aea),
+          # which hdiutil cannot mount directly. Decrypt it first; ipsw fetches the key.
+          AEA=$(find fsdmg -type f -name '*.aea' | head -1)
+          if [ -n "$AEA" ]; then
+            echo "AEA detected: $AEA"
+            ipsw fw aea --info "$AEA" 2>&1 | tail -15 | tee -a ../out/11_dmg.txt || true
+            ipsw fw aea "$AEA" -o "$(dirname "$AEA")" 2>&1 | tail -15 | tee -a ../out/11_dmg.txt || true
+          fi
+          find fsdmg -type f -name '*.dmg' -exec ls -lh {} + | tee -a ../out/11_dmg.txt || true
+          DMG=$(find fsdmg -type f -name '*.dmg' -size +50M | head -1)
           echo "DMG=$DMG" | tee -a ../out/11_dmg.txt
           test -n "$DMG"
           hdiutil attach -readonly -nobrowse -mountpoint /tmp/rootfs "$DMG" 2>&1 | tail -5
