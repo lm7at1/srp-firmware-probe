@@ -30,6 +30,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@v4   # for cfg_order.py
+
       - name: Host and disk
         run: |
           set -x
@@ -186,6 +188,21 @@ jobs:
             if [ -n "$N" ]; then sed -n "$((N)),$((N+22))p" work/lfw.txt; fi
           } | tee out/43_label_from_wire_bound.txt
           rm -f work/lfw.txt
+          # Does decompression run before signature verification on THIS build?
+          # Same CFG + dominator method as 01_PRODUCTION_CALL_PATH.md section 1.4.
+          python3 cfg_order.py work/text.tmp _srpk_label_from_wire_ _srp_sig0_verify \
+            > out/44_decoder_vs_verify_order.txt 2>&1 || true
+          # and the other direction: who calls the verifier, and who calls the evaluator
+          {
+            echo "=== callers of _srp_sig0_verify ==="
+            awk '/^_[A-Za-z_0-9.]+:$/{s=substr($0,1,length($0)-1); next}
+                 /bl.*_srp_sig0_verify/{print $1"  <- "s}' work/text.tmp || true
+            echo "=== callers of _srp_dns_evaluate / _srp_evaluate ==="
+            awk '/^_[A-Za-z_0-9.]+:$/{s=substr($0,1,length($0)-1); next}
+                 /b(l)?[[:space:]].*_srp(_dns)?_evaluate/{print $1"  "$2"  "$NF"  <- "s}' work/text.tmp || true
+          } > out/45_eval_and_verify_callers.txt 2>&1 || true
+          head -60 out/44_decoder_vs_verify_order.txt
+          cat out/45_eval_and_verify_callers.txt
           rm -f work/text.tmp
           python3 - work/target.bin <<'PY' | tee out/41_constants.txt
           import struct, sys
