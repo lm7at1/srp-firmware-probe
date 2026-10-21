@@ -132,11 +132,13 @@ jobs:
           nm -mu work/target.bin       > out/24_undefined.txt 2>&1 || true
           otool -L work/target.bin     > out/25_dylibs.txt    2>&1 || true
           ARCH=$(lipo -info work/target.bin 2>/dev/null | sed 's/.*: //' | awk '{print $NF}')
-          if lipo -info work/target.bin 2>/dev/null | grep -q "fat file"; then
+          # NB: a thin file prints "Non-fat file: ...", which contains the substring "fat file" --
+          # anchor the test or lipo -thin fails and $T ends up empty.
+          T=work/target.bin
+          if lipo -info work/target.bin 2>/dev/null | grep -q '^Architectures in the fat file'; then
             lipo -thin "$ARCH" work/target.bin -output work/thin.bin && T=work/thin.bin
-          else
-            T=work/target.bin
           fi
+          test -s "$T"
           echo "analysed slice: $ARCH" | tee -a out/20_identity.txt
           otool -tvV "$T" > work/text.tmp 2>&1 || true
           {
@@ -160,6 +162,13 @@ jobs:
             printf "count: %s\n" "$(grep -cE '_srpk_' out/23_nm.txt)"
             grep -E '_srpk_' out/23_nm.txt || echo "(none)"
           } | tee out/40_CENSUS.txt
+          # Where is signature verification actually called from? Attribute each call site to the
+          # nearest preceding symbol. Emits only derived call-site facts, not the disassembly.
+          awk '/^_[A-Za-z_0-9.]+:$/{sym=substr($0,1,length($0)-1); next}
+               /bl.*(_SecKeyVerifySignature|_CC_SHA256_(Init|Update|Final))/{
+                 print $1"  "$NF"  <- "sym }' work/text.tmp > out/42_verify_callsites.txt || true
+          wc -l out/42_verify_callsites.txt | tee -a out/42_verify_callsites.txt
+          cat out/42_verify_callsites.txt
           rm -f work/text.tmp
           python3 - work/target.bin <<'PY' | tee out/41_constants.txt
           import struct, sys
