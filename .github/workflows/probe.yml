@@ -2,25 +2,28 @@ name: srp-mdns-proxy firmware probe
 
 # Answers one question: does /usr/libexec/srp-mdns-proxy in Apple TV / HomePod firmware contain
 # multi-precision (public-key) arithmetic? A constant-time bignum implementation is defined by its
-# add-with-carry chains, so counting adcs/sbcs settles it without needing symbols.
+# add-with-carry chains, so counting adcs/sbcs settles it on a stripped binary without symbols.
 #
 # PUBLIC REPO. Artifacts here are world-readable, so this workflow uploads ONLY aggregate facts
 # about the binary -- hashes, section sizes, symbol and import lists, instruction counts. It does
 # NOT upload the firmware, the binary, or a full disassembly: a complete instruction dump of a
-# proprietary binary is a reproduction of it, not a fact about it. The guard step below enforces
-# that mechanically.
+# proprietary binary is a reproduction of it, not a fact about it. The guard step enforces that.
 
 on:
   workflow_dispatch:
     inputs:
       device:
-        description: "device identifier, e.g. AppleTV11,1 (Apple TV 4K 2nd gen) or AppleTV14,1 (3rd gen)"
+        description: "device identifier, e.g. AppleTV11,1 (ATV 4K 2nd gen), AppleTV14,1 (3rd gen), AudioAccessory5,1 (HomePod mini)"
         required: true
         default: "AppleTV11,1"
       version:
-        description: "OS version, e.g. 26.6 (blank = latest)"
+        description: "OS version to try first, e.g. 26.6 (blank = go straight to --latest)"
         required: false
         default: ""
+      list_only:
+        description: "true = only enumerate what firmware exists, download nothing"
+        required: false
+        default: "false"
 
 jobs:
   probe:
@@ -51,29 +54,56 @@ jobs:
           }
           ipsw version | tee out/02_ipsw_version.txt
 
-      - name: Download the full IPSW
+      - name: Enumerate what firmware actually exists
+        continue-on-error: true
         run: |
           set -x
+          for D in "${{ inputs.device }}" AppleTV11,1 AppleTV14,1 AudioAccessory5,1 AudioAccessory6,1; do
+            echo "########## device=$D ##########" >> out/05_ipsw_available.txt
+            ipsw download ipsw --device "$D" --urls --confirm 2>&1 | head -25 >> out/05_ipsw_available.txt || true
+            echo "-- latest --" >> out/05_ipsw_available.txt
+            ipsw download ipsw --device "$D" --latest --urls --confirm 2>&1 | head -10 >> out/05_ipsw_available.txt || true
+          done
+          # version strings visible in the URLs, to learn what --version expects
+          grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' out/05_ipsw_available.txt | sort -u | head -40 \
+            | tee out/06_versions_seen.txt || true
+          wc -c out/05_ipsw_available.txt
+
+      - name: Download the full IPSW
+        if: inputs.list_only != 'true'
+        run: |
+          set -x
+          set -o pipefail          # otherwise `cmd | tee` hides a failing cmd
           cd work
-          VER=""
-          if [ -n "${{ inputs.version }}" ]; then VER="--version ${{ inputs.version }}"; else VER="--latest"; fi
-          ipsw download ipsw --device "${{ inputs.device }}" $VER --confirm 2>&1 | tail -25
-          ls -lh *.ipsw | tee ../out/10_ipsw.txt
-          shasum -a 256 *.ipsw | tee -a ../out/10_ipsw.txt
+          if [ -n "${{ inputs.version }}" ]; then
+            ipsw download ipsw --device "${{ inputs.device }}" --version "${{ inputs.version }}" --confirm 2>&1 | tail -25 || true
+          fi
+          if ! ls *.ipsw >/dev/null 2>&1; then
+            echo "requested version absent or not given; falling back to --latest"
+            ipsw download ipsw --device "${{ inputs.device }}" --latest --confirm 2>&1 | tail -25 || true
+          fi
+          ls -lh *.ipsw                              # bare: a failure here fails the step
+          shasum -a 256 *.ipsw > ../out/10_ipsw.txt
+          cat ../out/10_ipsw.txt
 
       - name: Extract and mount the root filesystem
+        if: inputs.list_only != 'true'
         run: |
           set -x
+          set -o pipefail
           cd work
-          ipsw extract --dmg fs *.ipsw -o fsdmg 2>&1 | tail -20 || true
-          DMG=$(find fsdmg . -maxdepth 4 -name '*.dmg' -size +400M | head -1)
-          echo "DMG=$DMG" | tee ../out/11_dmg.txt
+          IPSW=$(ls *.ipsw | head -1)
+          ipsw extract --dmg fs "$IPSW" -o fsdmg 2>&1 | tail -20 || true
+          find fsdmg . -maxdepth 4 -name '*.dmg' -size +200M -exec ls -lh {} + | tee ../out/11_dmg.txt || true
+          DMG=$(find fsdmg . -maxdepth 4 -name '*.dmg' -size +200M | head -1)
+          echo "DMG=$DMG" | tee -a ../out/11_dmg.txt
           test -n "$DMG"
           hdiutil attach -readonly -nobrowse -mountpoint /tmp/rootfs "$DMG" 2>&1 | tail -5
           ls /tmp/rootfs | head -20 | tee -a ../out/11_dmg.txt
           ls -l /tmp/rootfs/usr/libexec/srp-mdns-proxy 2>&1 | tee ../out/12_target.txt || true
 
       - name: Measure (aggregates only — no disassembly is kept)
+        if: inputs.list_only != 'true'
         run: |
           set -x
           B=/tmp/rootfs/usr/libexec/srp-mdns-proxy
@@ -83,16 +113,15 @@ jobs:
             exit 0
           fi
           cp "$B" work/target.bin
-          ls -l work/target.bin        | tee    out/20_identity.txt
+          ls -l work/target.bin         | tee    out/20_identity.txt
           shasum -a 256 work/target.bin | tee -a out/20_identity.txt
-          file work/target.bin         | tee -a out/20_identity.txt
-          lipo -info work/target.bin   | tee -a out/20_identity.txt || true
+          file work/target.bin          | tee -a out/20_identity.txt
+          lipo -info work/target.bin    | tee -a out/20_identity.txt || true
           codesign -dvvv work/target.bin 2>&1 | tee out/21_codesign.txt || true
-          size -l -m work/target.bin   > out/22_sections.txt 2>&1 || true
+          size -l -m work/target.bin   > out/22_sections.txt  2>&1 || true
           nm -n  work/target.bin       > out/23_nm.txt        2>&1 || true
           nm -mu work/target.bin       > out/24_undefined.txt 2>&1 || true
           otool -L work/target.bin     > out/25_dylibs.txt    2>&1 || true
-          # disassemble to a scratch file OUTSIDE out/, count, then delete it
           ARCH=$(lipo -info work/target.bin 2>/dev/null | sed 's/.*: //' | awk '{print $NF}')
           if lipo -info work/target.bin 2>/dev/null | grep -q "fat file"; then
             lipo -thin "$ARCH" work/target.bin -output work/thin.bin && T=work/thin.bin
@@ -123,7 +152,6 @@ jobs:
             grep -E '_srpk_' out/23_nm.txt || echo "(none)"
           } | tee out/40_CENSUS.txt
           rm -f work/text.tmp
-          # crypto constant scan over the whole binary, in-line (no external script needed)
           python3 - work/target.bin <<'PY' | tee out/41_constants.txt
           import struct, sys
           b = open(sys.argv[1], 'rb').read()
@@ -169,5 +197,3 @@ jobs:
           name: srp-firmware-probe-${{ inputs.device }}
           path: out/**
           if-no-files-found: warn
-
-# Re-pushed to trigger workflow indexing on the default branch.
