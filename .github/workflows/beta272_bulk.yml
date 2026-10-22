@@ -69,9 +69,16 @@ jobs:
         run: |
           set -x
           cd work
-          ipsw download ota --platform macos --beta --confirm 2>&1 | tail -20
-          ls -lh *.zip *.aea 2>/dev/null | tee ../out/30_downloaded.txt || true
-          Z=$(ls *.zip 2>/dev/null | head -1)
+          ipsw download ota --platform macos --beta --confirm --output . 2>&1 | tail -20 || true
+          # Do not guess the filename: ipsw may use a per-build subdirectory and/or .aea.
+          { echo "=== anything large anywhere under the workspace or ipsw cache ==="
+            find . "$HOME/.ipsw" "$HOME/Downloads" -type f -size +100M 2>/dev/null -exec ls -lh {} + || true
+            echo "=== full listing of work/ ==="
+            ls -laR . | head -60
+            df -h / | tail -1
+          } | tee ../out/30_downloaded.txt
+          Z=$(find . "$HOME/.ipsw" "$HOME/Downloads" -type f -size +100M 2>/dev/null | head -1)
+          echo "PAYLOAD=$Z" | tee -a ../out/30_downloaded.txt
           test -n "$Z"
           shasum -a 256 "$Z" | tee -a ../out/30_downloaded.txt
           { echo "=== ipsw ota info ==="
