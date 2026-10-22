@@ -1,0 +1,136 @@
+name: macOS 27.x beta probe
+
+# Apple asked us to test on the macOS 27.2 beta. The previously recorded blocker was that the OTA
+# payload is LZRaven/pbzm and "needs a macOS 27+ host to decode". Two things to test here:
+#   1. there is no macos-27 runner label (a job targeting it never allocates), and
+#   2. `aa` IS present at /usr/bin/aa on macos-26 and macos-15 -- so the blocker may be the codec
+#      version rather than the host, which is a different and testable claim.
+#
+# Runs on macos-26, which exists and carries both `aa` and the known-vulnerable 26.6.2 binary as an
+# in-run positive control. Tries the cheap remote pattern extraction first and only then a payload
+# download, so an 18 GB transfer is a last resort rather than the default.
+#
+# Uploads aggregate text only; the guard step refuses anything binary-looking.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "macOS version to target, e.g. 27.2 (blank = whatever --beta offers)"
+        required: false
+        default: "27.2"
+      allow_payload_download:
+        description: "true = permit downloading an OTA payload (can be many GB)"
+        required: false
+        default: "false"
+
+jobs:
+  beta:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Host, disk, codec tools
+        run: |
+          set -x
+          mkdir -p out work
+          sw_vers | tee out/00_host.txt
+          df -h / | tail -1 | tee -a out/00_host.txt
+          { which aa && aa --help 2>&1 | head -20; } | tee out/01_aa.txt || echo "aa absent" | tee out/01_aa.txt
+          # which compression algorithms does THIS aa know? lzraven/pbzm is the question.
+          aa --help 2>&1 | grep -iE 'lz|raven|algorithm|-a ' | tee -a out/01_aa.txt || true
+
+      - name: Install ipsw
+        run: |
+          set -x
+          brew trust blacktop/tap || brew tap blacktop/tap || true
+          brew install --formula blacktop/tap/ipsw || {
+            URL=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
+                  | grep -oE 'https://[^"]*macos_universal\.tar\.gz' | head -1)
+            test -n "$URL"; curl -fsSL "$URL" -o /tmp/ipsw.tar.gz
+            mkdir -p /tmp/ib && tar -xzf /tmp/ipsw.tar.gz -C /tmp/ib
+            sudo install -m 0755 "$(find /tmp/ib -name ipsw -type f | head -1)" /usr/local/bin/ipsw
+          }
+          ipsw version | tee out/02_ipsw.txt
+
+      - name: What macOS 27.x firmware is published (release and beta)
+        continue-on-error: true
+        run: |
+          set -x
+          { echo "=== macos OTA, all ==="
+            ipsw download ota --platform macos --urls --confirm 2>&1 | head -30
+            echo "=== macos OTA, beta ==="
+            ipsw download ota --platform macos --beta --urls --confirm 2>&1 | head -30
+            echo "=== macos OTA, version ${{ inputs.version }} ==="
+            ipsw download ota --platform macos --version "${{ inputs.version }}" --urls --confirm 2>&1 | head -20
+            echo "=== macos IPSW urls ==="
+            ipsw download ipsw --macos --version "${{ inputs.version }}" --urls --confirm 2>&1 | head -20
+          } | tee out/10_available.txt
+          grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' out/10_available.txt | sort -u | tee out/11_versions.txt || true
+
+      - name: Cheap route — remote pattern extraction (no bulk download)
+        continue-on-error: true
+        run: |
+          set -x
+          cd work
+          for ARGS in "--platform macos --beta --version ${{ inputs.version }}" \
+                      "--platform macos --beta" \
+                      "--platform macos --version ${{ inputs.version }}"; do
+            echo "##### ipsw download ota $ARGS --pattern usr/libexec/srp-mdns-proxy" >> ../out/20_pattern.txt
+            ipsw download ota $ARGS --pattern 'usr/libexec/srp-mdns-proxy' --confirm 2>&1 \
+              | tail -25 >> ../out/20_pattern.txt || true
+            find . -name 'srp-mdns-proxy*' -type f | tee -a ../out/20_pattern.txt
+            if find . -name 'srp-mdns-proxy*' -type f | grep -q .; then echo "GOT IT"; break; fi
+          done
+
+      - name: Analyse whatever we obtained, with the 26.6.2 host binary as control
+        if: always()
+        run: |
+          set -x
+          analyse() {   # $1 = path, $2 = label
+            local B="$1" L="$2"
+            [ -f "$B" ] || { echo "[$L] absent"; return; }
+            echo "===== $L ====="
+            ls -l "$B"; shasum -a 256 "$B"; lipo -info "$B" 2>/dev/null || true
+            local ARCH T; ARCH=$(lipo -info "$B" 2>/dev/null | sed 's/.*: //' | awk '{print $NF}'); T="$B"
+            if lipo -info "$B" 2>/dev/null | grep -q '^Architectures in the fat file'; then
+              lipo -thin "$ARCH" "$B" -output "work/${L}.thin" && T="work/${L}.thin"
+            fi
+            echo "slice: $ARCH"
+            echo "srpk symbols: $(nm -a "$T" 2>/dev/null | grep -c srpk || true)"
+            otool -tvV "$T" > "work/${L}.txt" 2>&1 || true
+            awk '/^_srpk_label_from_wire_:$/{f=1} f{print} f&&/^_[A-Za-z_0-9.]+:$/&&!/_srpk_label_from_wire_:/{exit}' \
+                "work/${L}.txt" > "work/${L}.lfw" || true
+            echo "label_from_wire instructions: $(grep -cE '^[0-9a-f]{16}' "work/${L}.lfw")"
+            # Precise test: at the site that follows the integer reader, is txn->lim loaded and
+            # compared against the offset? 27.0.1 adds: ldr lim / sub / cmp / b.hi.
+            echo "--- each integer-reader site, next 12 instructions ---"
+            grep -nE 'bl[[:space:]]+(_srpk_integer_from_wire_max_|0x[0-9a-f]+)' "work/${L}.lfw" \
+              | head -6 | cut -d: -f1 | while read n; do
+                  echo "### site line $n"; sed -n "${n},$((n+12))p" "work/${L}.lfw"
+                done
+            rm -f "work/${L}.txt" "work/${L}.lfw" "work/${L}.thin"
+          }
+          {
+            analyse /usr/libexec/srp-mdns-proxy "control_26.6.2"
+            B=$(find work -name 'srp-mdns-proxy' -type f | head -1)
+            if [ -n "$B" ]; then analyse "$B" "target_27x"; else echo "===== target_27x NOT OBTAINED ====="; fi
+          } | tee out/30_compare.txt
+
+      - name: Guard — text only
+        if: always()
+        run: |
+          set -x
+          BAD=0
+          for f in $(find out -type f); do
+            file "$f" | grep -qiE 'Mach-O|executable|archive|disk image' && { echo "REFUSING $f"; BAD=1; }
+            [ "$(wc -c < "$f")" -gt 2000000 ] && { echo "REFUSING $f too big"; BAD=1; }
+          done
+          find out -type f -exec wc -c {} +
+          test "$BAD" -eq 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: beta272
+          path: out/**
+          if-no-files-found: warn
