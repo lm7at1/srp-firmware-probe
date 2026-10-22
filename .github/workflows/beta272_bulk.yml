@@ -1,0 +1,135 @@
+name: macOS 27.2 beta bulk extract
+
+# Remote pattern extraction cannot see inside the 27.2 OTA (the filesystem is a compressed asset,
+# so per-file enumeration returns "no files found" -- an enumeration limit, NOT evidence the path is
+# absent). And macos-26's /usr/bin/aa advertises only lzfse, lzma, zlib, lz4, lzbitmap, raw -- no
+# LZRaven/pbzm -- so it cannot decode the payload.
+#
+# The untested question: does ipsw implement LZRaven decoding itself, independent of `aa`? If so the
+# recorded "needs a macOS 27 host" blocker is wrong and 27.2 can be tested here. This job probes
+# ipsw's own OTA subcommands and the asset size first, then optionally pulls the payload and tries
+# every extraction route, with the host's vulnerable 26.6.2 binary as an in-run positive control.
+
+on:
+  workflow_dispatch:
+    inputs:
+      download:
+        description: "true = actually download the OTA payload (many GB)"
+        required: false
+        default: "false"
+
+jobs:
+  bulk:
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - name: Host and tools
+        run: |
+          set -x
+          mkdir -p out work
+          sw_vers | tee out/00_host.txt
+          df -h / | tail -1 | tee -a out/00_host.txt
+          brew trust blacktop/tap || brew tap blacktop/tap || true
+          brew install --formula blacktop/tap/ipsw || {
+            URL=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
+                  | grep -oE 'https://[^"]*macos_universal\.tar\.gz' | head -1)
+            curl -fsSL "$URL" -o /tmp/i.tgz; mkdir -p /tmp/ib; tar -xzf /tmp/i.tgz -C /tmp/ib
+            sudo install -m 0755 "$(find /tmp/ib -name ipsw -type f | head -1)" /usr/local/bin/ipsw
+          }
+          ipsw version | tee out/01_ipsw.txt
+
+      - name: What can ipsw do with an OTA, and does it know LZRaven?
+        continue-on-error: true
+        run: |
+          set -x
+          { echo "=== ipsw ota --help ==="   ; ipsw ota --help 2>&1 | head -40
+            echo "=== ipsw ota extract -h ===" ; ipsw ota extract --help 2>&1 | head -25
+            echo "=== ipsw ota ls -h ==="      ; ipsw ota ls --help 2>&1 | head -20
+            echo "=== ipsw fw --help ==="      ; ipsw fw --help 2>&1 | head -30
+            echo "=== lzraven / raven / pbzm mentions in ipsw help tree ==="
+            for c in ota fw dyld idev; do ipsw $c --help 2>&1; done | grep -iE 'raven|pbzm|aea|aa ' || echo "(none)"
+          } | tee out/10_ipsw_caps.txt
+
+      - name: Locate the beta asset and its size
+        continue-on-error: true
+        run: |
+          set -x
+          ipsw download ota --platform macos --beta --urls --confirm 2>&1 | tee out/20_beta_urls.txt
+          U=$(grep -oE 'https://updates\.cdn-apple\.com/[^ ]+\.zip' out/20_beta_urls.txt | head -1)
+          echo "URL=$U" | tee -a out/20_beta_urls.txt
+          if [ -n "$U" ]; then
+            curl -sIL "$U" | grep -iE '^(HTTP|content-length|content-type)' | tee out/21_asset_head.txt
+            SZ=$(curl -sIL "$U" | grep -i '^content-length' | tail -1 | tr -dc '0-9')
+            echo "bytes=$SZ  GiB=$(echo "scale=2; $SZ/1073741824" | bc 2>/dev/null)" | tee -a out/21_asset_head.txt
+          fi
+
+      - name: Pull the payload and try every extraction route
+        if: inputs.download == 'true'
+        continue-on-error: true
+        run: |
+          set -x
+          cd work
+          ipsw download ota --platform macos --beta --confirm 2>&1 | tail -20
+          ls -lh *.zip *.aea 2>/dev/null | tee ../out/30_downloaded.txt || true
+          Z=$(ls *.zip 2>/dev/null | head -1)
+          test -n "$Z"
+          shasum -a 256 "$Z" | tee -a ../out/30_downloaded.txt
+          { echo "=== ipsw ota ls ==="
+            ipsw ota ls "$Z" 2>&1 | head -40
+            echo "=== ipsw ota ls | grep srp ==="
+            ipsw ota ls "$Z" 2>&1 | grep -i 'srp\|mdns' | head -20
+            echo "=== ipsw ota extract pattern ==="
+            ipsw ota extract "$Z" 'usr/libexec/srp-mdns-proxy' -o ex 2>&1 | tail -20
+            echo "=== zip members (payload layout) ==="
+            unzip -l "$Z" 2>/dev/null | head -30
+          } | tee ../out/31_extract.txt
+          find . -name 'srp-mdns-proxy*' -type f | tee ../out/32_found.txt || true
+
+      - name: Compare against the 26.6.2 control
+        if: always()
+        run: |
+          set -x
+          analyse() {
+            local B="$1" L="$2"
+            [ -f "$B" ] || { echo "[$L] NOT OBTAINED"; return; }
+            echo "===== $L ====="
+            ls -l "$B"; shasum -a 256 "$B"; lipo -info "$B" 2>/dev/null || true
+            local ARCH T; ARCH=$(lipo -info "$B" 2>/dev/null | sed 's/.*: //' | awk '{print $NF}'); T="$B"
+            if lipo -info "$B" 2>/dev/null | grep -q '^Architectures in the fat file'; then
+              lipo -thin "$ARCH" "$B" -output "work/$L.thin" && T="work/$L.thin"; fi
+            echo "slice: $ARCH ; srpk symbols: $(nm -a "$T" 2>/dev/null | grep -c srpk || true)"
+            otool -tvV "$T" > "work/$L.dis" 2>&1 || true
+            awk '/^_srpk_label_from_wire_:$/{f=1} f{print} f&&/^_[A-Za-z_0-9.]+:$/&&!/_srpk_label_from_wire_:/{exit}' \
+                "work/$L.dis" > "work/$L.lfw" || true
+            echo "label_from_wire instructions: $(grep -cE '^[0-9a-f]{16}' "work/$L.lfw")"
+            echo "--- ldp of message,p  (the 26.6.2 shape) ---"
+            grep -nE 'ldp[[:space:]]+x[0-9]+, x[0-9]+, \[x[0-9]+\]' "work/$L.lfw" | head -5
+            echo "--- ldr of txn->lim at [x19,#0x10]  (the 27.0.1 added load) ---"
+            grep -cE 'ldr[[:space:]]+x[0-9]+, \[x19, #0x10\]' "work/$L.lfw"
+            echo "--- offset-vs-extent triple: sub then cmp then b.hi ---"
+            grep -nE -A2 '[[:space:]]sub[[:space:]]+x[0-9]+, x[0-9]+, x[0-9]+' "work/$L.lfw" | head -12
+            rm -f "work/$L.dis" "work/$L.lfw" "work/$L.thin"
+          }
+          { analyse /usr/libexec/srp-mdns-proxy "control_26.6.2"
+            B=$(find work -name 'srp-mdns-proxy' -type f 2>/dev/null | head -1)
+            analyse "$B" "target_27.2"
+          } | tee out/40_compare.txt
+
+      - name: Guard — text only
+        if: always()
+        run: |
+          set -x
+          BAD=0
+          for f in $(find out -type f); do
+            file "$f" | grep -qiE 'Mach-O|executable|archive|disk image' && { echo "REFUSING $f"; BAD=1; }
+            [ "$(wc -c < "$f")" -gt 2000000 ] && { echo "REFUSING $f"; BAD=1; }
+          done
+          find out -type f -exec wc -c {} +
+          test "$BAD" -eq 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: beta272-bulk
+          path: out/**
+          if-no-files-found: warn
