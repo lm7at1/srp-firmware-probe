@@ -74,12 +74,16 @@ jobs:
           Z=$(ls *.zip 2>/dev/null | head -1)
           test -n "$Z"
           shasum -a 256 "$Z" | tee -a ../out/30_downloaded.txt
-          { echo "=== ipsw ota ls ==="
-            ipsw ota ls "$Z" 2>&1 | head -40
-            echo "=== ipsw ota ls | grep srp ==="
-            ipsw ota ls "$Z" 2>&1 | grep -i 'srp\|mdns' | head -20
-            echo "=== ipsw ota extract pattern ==="
-            ipsw ota extract "$Z" 'usr/libexec/srp-mdns-proxy' -o ex 2>&1 | tail -20
+          { echo "=== ipsw ota info ==="
+            ipsw ota info "$Z" 2>&1 | head -30
+            echo "=== ipsw ota ls | grep srp/mdns ==="
+            ipsw ota ls "$Z" 2>&1 | grep -iE 'srp|mdns' | head -20 || echo "(ls found no srp/mdns)"
+            echo "=== ipsw ota extract --pattern (payloadv2 search, per the tool help) ==="
+            ipsw ota extract "$Z" --pattern 'srp-mdns-proxy' --confirm -o ex 2>&1 | tail -30
+            echo "=== retry: anchored pattern ==="
+            ipsw ota extract "$Z" --pattern 'usr/libexec/srp-mdns-proxy' --confirm -o ex2 2>&1 | tail -20
+            echo "=== retry: positional filename form ==="
+            ipsw ota extract "$Z" 'usr/libexec/srp-mdns-proxy' -o ex3 2>&1 | tail -15
             echo "=== zip members (payload layout) ==="
             unzip -l "$Z" 2>/dev/null | head -30
           } | tee ../out/31_extract.txt
